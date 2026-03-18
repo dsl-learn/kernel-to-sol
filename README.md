@@ -22,6 +22,10 @@ Each problem writeup will typically include:
 
 This repository is a work in progress and will be updated continuously.
 
+## Problems
+
+- [001_attn_bwd](./001_attn_bwd): Backward pass for attention softmax, dropout, and value matmul.
+
 ## Reference
 
 - Benchmark: <https://research.nvidia.com/benchmarks/sol-execbench>
