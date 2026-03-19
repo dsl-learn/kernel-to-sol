@@ -25,6 +25,7 @@ This repository is a work in progress and will be updated continuously.
 ## Problems
 
 - [001_attn_bwd](./001_attn_bwd): Backward pass for attention softmax, dropout, and value matmul.
+- [002_vae_conv2d](./002_vae_conv2d): Fused VAE residual block with Conv3x3, GroupNorm, SiLU, and residual addition.
 
 ## Reference
 
