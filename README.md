@@ -30,3 +30,4 @@ This repository is a work in progress and will be updated continuously.
 ## Reference
 
 - Benchmark: <https://research.nvidia.com/benchmarks/sol-execbench>
+- Original repository: <https://github.com/nvidia/sol-execbench>
