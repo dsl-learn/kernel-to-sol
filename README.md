@@ -27,6 +27,16 @@ This repository is a work in progress and will be updated continuously.
 - [001_attn_bwd](./001_attn_bwd): Backward pass for attention softmax, dropout, and value matmul.
 - [002_vae_conv2d](./002_vae_conv2d): Fused VAE residual block with Conv3x3, GroupNorm, SiLU, and residual addition.
 
+## Claude Skills
+
+The `.claude/skills/` directory contains model-invoked skills for this project:
+
+| Skill | Triggers when… |
+|---|---|
+| `new-kernel` | Creating a new kernel implementation from a torch reference |
+| `b200-tuning` | Optimizing for B200/Blackwell performance (tiles, TMA, WGMMA, pipeline) |
+| `kernel-testing` | Running `test.py`, diagnosing failures, or using Triton IR debug flags |
+
 ## Reference
 
 - Benchmark: <https://research.nvidia.com/benchmarks/sol-execbench>
