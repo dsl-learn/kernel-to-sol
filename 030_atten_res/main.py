@@ -8,7 +8,8 @@ import torch
 ROOT_DIR = Path(__file__).resolve().parent
 TORCH_REF_PATH = ROOT_DIR / "00_torch_ref" / "submission.py"
 TRITON_PATH = ROOT_DIR / "01_triton" / "submission.py"
-CUTILE_PATH = ROOT_DIR / "02_cutile" / "submission.py"
+CUTILE_PATH   = ROOT_DIR / "02_cutile"   / "submission.py"
+CUTEDSL_PATH  = ROOT_DIR / "03_cutedsl"  / "submission.py"
 
 HIDDEN_SIZE = 2560
 
@@ -27,8 +28,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--impl",
         default="auto",
-        choices=("auto", "torch_ref", "triton", "cutile"),
-        help="Implementation to validate. 'auto' picks cutile on CUDA and torch_ref otherwise.",
+        choices=("auto", "torch_ref", "triton", "cutile", "cutedsl"),
+        help="Implementation to validate. 'auto' picks cutedsl on CUDA and torch_ref otherwise.",
     )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seq-len", type=int, default=None)
@@ -58,8 +59,8 @@ def _load_module(module_path: Path, module_name: str):
 
 def _resolve_impl_name(impl_arg: str, device: torch.device) -> str:
     if impl_arg == "auto":
-        return "cutile" if device.type == "cuda" else "torch_ref"
-    if impl_arg in ("triton", "cutile") and device.type != "cuda":
+        return "cutedsl" if device.type == "cuda" else "torch_ref"
+    if impl_arg in ("triton", "cutile", "cutedsl") and device.type != "cuda":
         raise RuntimeError(f"The {impl_arg} implementation requires a CUDA device")
     return impl_arg
 
@@ -121,6 +122,8 @@ if __name__ == "__main__":
         impl_module = _load_module(TRITON_PATH, "atten_res_triton")
     elif impl_name == "cutile":
         impl_module = _load_module(CUTILE_PATH, "atten_res_cutile")
+    elif impl_name == "cutedsl":
+        impl_module = _load_module(CUTEDSL_PATH, "atten_res_cutedsl")
     else:
         impl_module = torch_ref_module
 
