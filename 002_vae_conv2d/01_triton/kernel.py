@@ -4,69 +4,47 @@ import triton
 import triton.language as tl
 
 
-GN_SILU_BLOCK = 1024
+GN_SILU_BLOCK  = 1024
+NUM_SMS        = 160   # B200
+TARGET_PROGRAMS = NUM_SMS * 8   # 1280: enough waves to hide scheduling
 
 
-# ---------------------------------------------------------------------------
-# Kernel 1 – partial stats (sum, sum_sq) per chunk, accumulated via atomics.
-# Grid: (N * G * S,)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Path A — one program per group (used when N*G >= NUM_SMS).
+# Stats and normalize are fused: stats accumulate in registers, never touch
+# global memory.
+# Grid: (N * G,)
+# ===========================================================================
+
 @triton.jit
-def _gn_stats_kernel(
-    x_ptr, stats_ptr,
-    C, HW, G, C_per_G, group_size, chunk_size, S,
-    BLOCK: tl.constexpr,
-):
-    pid      = tl.program_id(0)
-    group_id = pid // S
-    s        = pid  % S
-
-    n = group_id // G
-    g = group_id  % G
-    group_start = n * C * HW + g * C_per_G * HW
-    chunk_start = s * chunk_size
-
-    _sum    = 0.0
-    _sum_sq = 0.0
-    for i in range(tl.cdiv(chunk_size, BLOCK)):
-        offs = chunk_start + i * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < group_size
-        x = tl.load(x_ptr + group_start + offs, mask=mask, other=0.0).to(tl.float32)
-        _sum    += tl.sum(x)
-        _sum_sq += tl.sum(x * x)
-
-    tl.atomic_add(stats_ptr + group_id * 2 + 0, _sum)
-    tl.atomic_add(stats_ptr + group_id * 2 + 1, _sum_sq)
-
-
-# ---------------------------------------------------------------------------
-# Kernel 2a – read stats, normalize, SiLU.
-# Grid: (N * G * S,)
-# ---------------------------------------------------------------------------
-@triton.jit
-def _gn_norm_silu_kernel(
-    x_ptr, weight_ptr, bias_ptr, out_ptr, stats_ptr,
-    C, HW, G, C_per_G, group_size, chunk_size, S,
+def _gn_fused_norm_silu_kernel(
+    x_ptr, weight_ptr, bias_ptr, out_ptr,
+    C, HW, G, C_per_G, group_size,
     eps,
     BLOCK: tl.constexpr,
 ):
-    pid      = tl.program_id(0)
-    group_id = pid // S
-    s        = pid  % S
-
-    n = group_id // G
-    g = group_id  % G
+    group_id    = tl.program_id(0)
+    n           = group_id // G
+    g           = group_id  % G
     group_start = n * C * HW + g * C_per_G * HW
-    chunk_start = s * chunk_size
 
-    total_sum    = tl.load(stats_ptr + group_id * 2 + 0).to(tl.float32)
-    total_sum_sq = tl.load(stats_ptr + group_id * 2 + 1).to(tl.float32)
-    mean = total_sum    / group_size
-    var  = total_sum_sq / group_size - mean * mean
+    # Pass 1: accumulate sum / sum_sq in registers.
+    _sum = tl.zeros([BLOCK], dtype=tl.float32)
+    _ssq = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in range(tl.cdiv(group_size, BLOCK)):
+        offs = i * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < group_size
+        x    = tl.load(x_ptr + group_start + offs, mask=mask, other=0.0).to(tl.float32)
+        _sum += x
+        _ssq += x * x
+
+    mean = tl.sum(_sum) / group_size
+    var  = tl.sum(_ssq) / group_size - mean * mean
     rstd = tl.rsqrt(var + eps)
 
-    for i in range(tl.cdiv(chunk_size, BLOCK)):
-        offs = chunk_start + i * BLOCK + tl.arange(0, BLOCK)
+    # Pass 2: normalize + SiLU.
+    for i in range(tl.cdiv(group_size, BLOCK)):
+        offs = i * BLOCK + tl.arange(0, BLOCK)
         mask = offs < group_size
         x = tl.load(x_ptr + group_start + offs, mask=mask, other=0.0).to(tl.float32)
 
@@ -80,34 +58,33 @@ def _gn_norm_silu_kernel(
         tl.store(out_ptr + group_start + offs, y, mask=mask)
 
 
-# ---------------------------------------------------------------------------
-# Kernel 2b – read stats, normalize, SiLU, add residual.
-# Grid: (N * G * S,)
-# ---------------------------------------------------------------------------
 @triton.jit
-def _gn_norm_silu_add_kernel(
-    x_ptr, weight_ptr, bias_ptr, residual_ptr, out_ptr, stats_ptr,
-    C, HW, G, C_per_G, group_size, chunk_size, S,
+def _gn_fused_norm_silu_add_kernel(
+    x_ptr, weight_ptr, bias_ptr, residual_ptr, out_ptr,
+    C, HW, G, C_per_G, group_size,
     eps,
     BLOCK: tl.constexpr,
 ):
-    pid      = tl.program_id(0)
-    group_id = pid // S
-    s        = pid  % S
-
-    n = group_id // G
-    g = group_id  % G
+    group_id    = tl.program_id(0)
+    n           = group_id // G
+    g           = group_id  % G
     group_start = n * C * HW + g * C_per_G * HW
-    chunk_start = s * chunk_size
 
-    total_sum    = tl.load(stats_ptr + group_id * 2 + 0).to(tl.float32)
-    total_sum_sq = tl.load(stats_ptr + group_id * 2 + 1).to(tl.float32)
-    mean = total_sum    / group_size
-    var  = total_sum_sq / group_size - mean * mean
+    _sum = tl.zeros([BLOCK], dtype=tl.float32)
+    _ssq = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in range(tl.cdiv(group_size, BLOCK)):
+        offs = i * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < group_size
+        x    = tl.load(x_ptr + group_start + offs, mask=mask, other=0.0).to(tl.float32)
+        _sum += x
+        _ssq += x * x
+
+    mean = tl.sum(_sum) / group_size
+    var  = tl.sum(_ssq) / group_size - mean * mean
     rstd = tl.rsqrt(var + eps)
 
-    for i in range(tl.cdiv(chunk_size, BLOCK)):
-        offs = chunk_start + i * BLOCK + tl.arange(0, BLOCK)
+    for i in range(tl.cdiv(group_size, BLOCK)):
+        offs = i * BLOCK + tl.arange(0, BLOCK)
         mask = offs < group_size
         x   = tl.load(x_ptr        + group_start + offs, mask=mask, other=0.0).to(tl.float32)
         res = tl.load(residual_ptr + group_start + offs, mask=mask, other=0.0).to(tl.float32)
@@ -122,9 +99,140 @@ def _gn_norm_silu_add_kernel(
         tl.store(out_ptr + group_start + offs, y, mask=mask)
 
 
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Path B — spatial split, no atomics (used when N*G < NUM_SMS).
+#
+# Kernel 1 (_gn_partial_stats_kernel):
+#   Grid (N*G*S,).  Each program writes its partial sum/sum_sq to its own
+#   unique slot in partial[pid*2 : pid*2+2] — no collision, no atomic.
+#
+# Kernel 2 (_gn_split_norm_silu[_add]_kernel):
+#   Grid (N*G*S,).  Each program reads all S partial entries for its group
+#   (O(S) scalar loads, S is small), reduces inline to get mean/rstd, then
+#   normalizes its spatial chunk.
+#
+# The implicit barrier between the two launches ensures all partial stats
+# are committed before any norm program reads them.
+# ===========================================================================
+
+@triton.jit
+def _gn_partial_stats_kernel(
+    x_ptr, partial_ptr,
+    C, HW, G, C_per_G, group_size, chunk_size, S,
+    BLOCK: tl.constexpr,
+):
+    pid         = tl.program_id(0)
+    group_id    = pid // S
+    s           = pid  % S
+    n           = group_id // G
+    g           = group_id  % G
+    group_start = n * C * HW + g * C_per_G * HW
+    chunk_start = s * chunk_size
+
+    _sum = tl.zeros([BLOCK], dtype=tl.float32)
+    _ssq = tl.zeros([BLOCK], dtype=tl.float32)
+    chunk_end = chunk_start + chunk_size
+    for i in range(tl.cdiv(chunk_size, BLOCK)):
+        offs = chunk_start + i * BLOCK + tl.arange(0, BLOCK)
+        mask = (offs < chunk_end) & (offs < group_size)
+        x    = tl.load(x_ptr + group_start + offs, mask=mask, other=0.0).to(tl.float32)
+        _sum += x
+        _ssq += x * x
+
+    # Unique slot per pid — no atomic.
+    tl.store(partial_ptr + pid * 2 + 0, tl.sum(_sum))
+    tl.store(partial_ptr + pid * 2 + 1, tl.sum(_ssq))
+
+
+@triton.jit
+def _gn_split_norm_silu_kernel(
+    x_ptr, weight_ptr, bias_ptr, out_ptr, partial_ptr,
+    C, HW, G, C_per_G, group_size, chunk_size, S,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    pid         = tl.program_id(0)
+    group_id    = pid // S
+    s           = pid  % S
+    n           = group_id // G
+    g           = group_id  % G
+    group_start = n * C * HW + g * C_per_G * HW
+    chunk_start = s * chunk_size
+
+    # Inline reduce: O(S) scalar reads to get full-group stats.
+    total_sum = 0.0
+    total_ssq = 0.0
+    base = group_id * S
+    for i in range(S):
+        total_sum += tl.load(partial_ptr + (base + i) * 2 + 0).to(tl.float32)
+        total_ssq += tl.load(partial_ptr + (base + i) * 2 + 1).to(tl.float32)
+
+    mean = total_sum / group_size
+    var  = total_ssq / group_size - mean * mean
+    rstd = tl.rsqrt(var + eps)
+
+    chunk_end = chunk_start + chunk_size
+    for i in range(tl.cdiv(chunk_size, BLOCK)):
+        offs = chunk_start + i * BLOCK + tl.arange(0, BLOCK)
+        mask = (offs < chunk_end) & (offs < group_size)
+        x = tl.load(x_ptr + group_start + offs, mask=mask, other=0.0).to(tl.float32)
+
+        c_local  = offs // HW
+        c_global = g * C_per_G + c_local
+        w = tl.load(weight_ptr + c_global, mask=mask, other=1.0).to(tl.float32)
+        b = tl.load(bias_ptr   + c_global, mask=mask, other=0.0).to(tl.float32)
+
+        y = (x - mean) * rstd * w + b
+        y = y * tl.sigmoid(y)
+        tl.store(out_ptr + group_start + offs, y, mask=mask)
+
+
+@triton.jit
+def _gn_split_norm_silu_add_kernel(
+    x_ptr, weight_ptr, bias_ptr, residual_ptr, out_ptr, partial_ptr,
+    C, HW, G, C_per_G, group_size, chunk_size, S,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    pid         = tl.program_id(0)
+    group_id    = pid // S
+    s           = pid  % S
+    n           = group_id // G
+    g           = group_id  % G
+    group_start = n * C * HW + g * C_per_G * HW
+    chunk_start = s * chunk_size
+
+    total_sum = 0.0
+    total_ssq = 0.0
+    base = group_id * S
+    for i in range(S):
+        total_sum += tl.load(partial_ptr + (base + i) * 2 + 0).to(tl.float32)
+        total_ssq += tl.load(partial_ptr + (base + i) * 2 + 1).to(tl.float32)
+
+    mean = total_sum / group_size
+    var  = total_ssq / group_size - mean * mean
+    rstd = tl.rsqrt(var + eps)
+
+    chunk_end = chunk_start + chunk_size
+    for i in range(tl.cdiv(chunk_size, BLOCK)):
+        offs = chunk_start + i * BLOCK + tl.arange(0, BLOCK)
+        mask = (offs < chunk_end) & (offs < group_size)
+        x   = tl.load(x_ptr        + group_start + offs, mask=mask, other=0.0).to(tl.float32)
+        res = tl.load(residual_ptr + group_start + offs, mask=mask, other=0.0).to(tl.float32)
+
+        c_local  = offs // HW
+        c_global = g * C_per_G + c_local
+        w = tl.load(weight_ptr + c_global, mask=mask, other=1.0).to(tl.float32)
+        b = tl.load(bias_ptr   + c_global, mask=mask, other=0.0).to(tl.float32)
+
+        y = (x - mean) * rstd * w + b
+        y = y * tl.sigmoid(y) + res
+        tl.store(out_ptr + group_start + offs, y, mask=mask)
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
 
 def _require_supported_shape(x: torch.Tensor, num_groups: int) -> None:
     if x.ndim != 4:
@@ -137,20 +245,62 @@ def _require_supported_shape(x: torch.Tensor, num_groups: int) -> None:
         )
 
 
-def _compute_S(N: int, G: int, group_size: int, block: int) -> int:
-    """
-    Choose spatial split factor S so that N*G*S is large enough to saturate
-    B200's SMs, but each chunk is at least `block` elements.
-    """
-    TARGET = 4096
-    S = max(1, TARGET // (N * G))
-    S = min(S, max(1, group_size // block))
-    return S
+def _launch_gn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    residual,   # torch.Tensor | None
+    out: torch.Tensor,
+    num_groups: int,
+    eps: float,
+) -> None:
+    N, C, H, W = x.shape
+    HW         = H * W
+    C_per_G    = C // num_groups
+    group_size = C_per_G * HW
+    NG         = N * num_groups
+
+    if NG >= NUM_SMS:
+        # Path A: one fused program per group.
+        grid = (NG,)
+        kw   = dict(BLOCK=GN_SILU_BLOCK, num_warps=16, num_stages=4)
+        if residual is None:
+            _gn_fused_norm_silu_kernel[grid](
+                x, weight, bias, out,
+                C, HW, num_groups, C_per_G, group_size, eps, **kw,
+            )
+        else:
+            _gn_fused_norm_silu_add_kernel[grid](
+                x, weight, bias, residual, out,
+                C, HW, num_groups, C_per_G, group_size, eps, **kw,
+            )
+    else:
+        # Path B: spatial split — no atomics.
+        S          = max(2, TARGET_PROGRAMS // NG)
+        chunk_size = triton.cdiv(group_size, S)
+        grid       = (NG * S,)
+        partial    = torch.empty(NG * S, 2, dtype=torch.float32, device=x.device)
+        kw         = dict(BLOCK=GN_SILU_BLOCK, num_warps=16, num_stages=4)
+
+        _gn_partial_stats_kernel[grid](
+            x, partial,
+            C, HW, num_groups, C_per_G, group_size, chunk_size, S, **kw,
+        )
+        if residual is None:
+            _gn_split_norm_silu_kernel[grid](
+                x, weight, bias, out, partial,
+                C, HW, num_groups, C_per_G, group_size, chunk_size, S, eps, **kw,
+            )
+        else:
+            _gn_split_norm_silu_add_kernel[grid](
+                x, weight, bias, residual, out, partial,
+                C, HW, num_groups, C_per_G, group_size, chunk_size, S, eps, **kw,
+            )
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Python-side wrappers
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def _group_norm_silu_triton(
     x: torch.Tensor,
@@ -163,29 +313,8 @@ def _group_norm_silu_triton(
     x      = x.contiguous()
     weight = weight.contiguous()
     bias   = bias.contiguous()
-
-    N, C, H, W = x.shape
-    HW         = H * W
-    C_per_G    = C // num_groups
-    group_size = C_per_G * HW
-    S          = _compute_S(N, num_groups, group_size, GN_SILU_BLOCK)
-    chunk_size = triton.cdiv(group_size, S)
-    grid       = (N * num_groups * S,)
-
-    stats = torch.zeros(N * num_groups, 2, dtype=torch.float32, device=x.device)
-    out   = torch.empty_like(x)
-
-    _gn_stats_kernel[grid](
-        x, stats,
-        C, HW, num_groups, C_per_G, group_size, chunk_size, S,
-        BLOCK=GN_SILU_BLOCK, num_warps=8,
-    )
-    _gn_norm_silu_kernel[grid](
-        x, weight, bias, out, stats,
-        C, HW, num_groups, C_per_G, group_size, chunk_size, S,
-        eps,
-        BLOCK=GN_SILU_BLOCK, num_warps=8,
-    )
+    out    = torch.empty_like(x)
+    _launch_gn(x, weight, bias, None, out, num_groups, eps)
     return out
 
 
@@ -202,35 +331,14 @@ def _group_norm_silu_add_triton(
     residual = residual.contiguous()
     weight   = weight.contiguous()
     bias     = bias.contiguous()
-
-    N, C, H, W = x.shape
-    HW         = H * W
-    C_per_G    = C // num_groups
-    group_size = C_per_G * HW
-    S          = _compute_S(N, num_groups, group_size, GN_SILU_BLOCK)
-    chunk_size = triton.cdiv(group_size, S)
-    grid       = (N * num_groups * S,)
-
-    stats = torch.zeros(N * num_groups, 2, dtype=torch.float32, device=x.device)
-    out   = torch.empty_like(x)
-
-    _gn_stats_kernel[grid](
-        x, stats,
-        C, HW, num_groups, C_per_G, group_size, chunk_size, S,
-        BLOCK=GN_SILU_BLOCK, num_warps=8,
-    )
-    _gn_norm_silu_add_kernel[grid](
-        x, weight, bias, residual, out, stats,
-        C, HW, num_groups, C_per_G, group_size, chunk_size, S,
-        eps,
-        BLOCK=GN_SILU_BLOCK, num_warps=8,
-    )
+    out      = torch.empty_like(x)
+    _launch_gn(x, weight, bias, residual, out, num_groups, eps)
     return out
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Entry point
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 @torch.no_grad()
 def run(
@@ -247,11 +355,11 @@ def run(
     """
     Fused residual block: Conv3x3 -> [GroupNorm+SiLU] -> Conv3x3 -> [GroupNorm+SiLU+Add].
 
-    Each [GroupNorm+SiLU] is split into two Triton kernels:
-      1. _gn_stats_kernel:    N*G*S programs compute partial sum/sum_sq via atomics.
-      2. _gn_norm_silu_kernel: N*G*S programs read completed stats, normalize, activate.
-    Splitting each group into S spatial chunks gives enough parallelism to
-    saturate B200's SMs even at small batch sizes.
+    GroupNorm dispatch:
+      Path A (N*G >= 160): single fused kernel per group; stats stay in registers.
+      Path B (N*G <  160): spatial-split into S chunks; partial stats written to
+                            unique per-chunk slots (no atomics), reduced inline in
+                            the norm kernel before normalizing each chunk.
     """
     _require_supported_shape(x, num_groups)
     if not x.is_cuda:
