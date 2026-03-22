@@ -60,49 +60,44 @@ torch::Tensor run(
     CUBLASLT_CHECK(cublasLtCreate(&ltHandle));
 
     // ----------------------------------------------------------------
-    // MatMul descriptor: F32 accumulation, BF16 scale factors
+    // MatMul descriptor: BF16 tensor core, F32 accumulation
     // ----------------------------------------------------------------
     cublasLtMatmulDesc_t matmulDesc;
     CUBLASLT_CHECK(cublasLtMatmulDescCreate(
-        &matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        &matmulDesc, CUBLAS_COMPUTE_32F_FAST_16BF, CUDA_R_32F));
 
-    // op(A) = A (M×K), op(B) = B^T (K×N from stored N×K)
-    cublasOperation_t opA = CUBLAS_OP_N;
-    cublasOperation_t opB = CUBLAS_OP_T;
+    // Col-major reformulation (no row-major constraint, full algorithm set):
+    //   want (row-major):  D = A @ B^T + R
+    //   equiv (col-major): D^T = B @ A^T + R^T
+    //   A_row(M×K) = col-major K×M (ld=K)
+    //   B_row(N×K) = col-major K×N (ld=K), pass as A' with opA=T → N×K
+    //   R/D row-major(M×N) = col-major N×M (ld=N)
+    cublasOperation_t opA = CUBLAS_OP_T;  // B_row (K×N col-major) → N×K
+    cublasOperation_t opB = CUBLAS_OP_N;  // A_row (K×M col-major) stays K×M
     CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
         matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
     CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
         matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
 
     // ----------------------------------------------------------------
-    // Matrix layouts — all row-major
+    // Matrix layouts — native col-major, no ORDER_ROW constraint
     // ----------------------------------------------------------------
-    cublasLtOrder_t rowOrder = CUBLASLT_ORDER_ROW;
-
     cublasLtMatrixLayout_t layoutA, layoutB, layoutC, layoutD;
-    // A (M×K): rows=M, cols=K, ld=K
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_16BF, M, K, K));
-    CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
-        layoutA, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
-    // B (N×K): rows=N, cols=K, ld=K  (transposed in-place via TRANSB=T)
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_16BF, N, K, K));
-    CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
-        layoutB, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
-    // C = residual (M×N): rows=M, cols=N, ld=N
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_16BF, M, N, N));
-    CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
-        layoutC, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
-    // D = output (M×N): same shape as C
-    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&layoutD, CUDA_R_16BF, M, N, N));
-    CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
-        layoutD, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
+    // A' = B_row viewed as K×N col-major, ld=K
+    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_16BF, K, N, K));
+    // B' = A_row viewed as K×M col-major, ld=K
+    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_16BF, K, M, K));
+    // C = residual viewed as N×M col-major, ld=N
+    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_16BF, N, M, N));
+    // D = output viewed as N×M col-major, ld=N
+    CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(&layoutD, CUDA_R_16BF, N, M, N));
 
     // ----------------------------------------------------------------
     // Algorithm heuristic search
     // ----------------------------------------------------------------
     cublasLtMatmulPreference_t pref;
     CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
-    size_t maxWs = 4ULL * 1024 * 1024;   // 4 MiB workspace budget
+    size_t maxWs = 32ULL * 1024 * 1024;  // 32 MiB workspace budget
     CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(
         pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &maxWs, sizeof(maxWs)));
 
@@ -122,14 +117,14 @@ torch::Tensor run(
         CUDA_CHECK(cudaMalloc(&workspace, heurResult.workspaceSize));
 
     // ----------------------------------------------------------------
-    // Execute: D = 1·A·op(B) + 1·R   (fused GEMM + residual)
+    // Execute: D^T = 1·op(B_row)·A_row^T + 1·R^T  (col-major, fused residual)
     // ----------------------------------------------------------------
     const float alpha = 1.0f, beta = 1.0f;
     CUBLASLT_CHECK(cublasLtMatmul(
         ltHandle, matmulDesc,
         &alpha,
-        A.data_ptr(), layoutA,
-        B.data_ptr(), layoutB,
+        B.data_ptr(), layoutA,   // A' ← B_row (K×N col-major, transposed to N×K)
+        A.data_ptr(), layoutB,   // B' ← A_row (K×M col-major)
         &beta,
         R.data_ptr(), layoutC,
         output.data_ptr(), layoutD,
