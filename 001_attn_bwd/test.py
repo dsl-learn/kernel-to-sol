@@ -6,33 +6,31 @@ import torch
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-TORCH_REF_PATH = ROOT_DIR / "00_torch_ref" / "submission.py"
-TRITON_PATH = ROOT_DIR / "01_triton" / "submission.py"
-CUTILE_PATH   = ROOT_DIR / "02_cutile"   / "submission.py"
-CUTEDSL_PATH  = ROOT_DIR / "03_cutedsl"  / "submission.py"
+TORCH_REF_PATH = ROOT_DIR / "00_torch_ref" / "kernel.py"
+TRITON_PATH = ROOT_DIR / "01_triton" / "kernel.py"
 
-HIDDEN_SIZE = 2560
 
 DEFAULT_CASES = (
-    {"batch_size": 1,  "seq_len": 64},
-    {"batch_size": 4,  "seq_len": 128},
-    {"batch_size": 16, "seq_len": 512},
+    {"batch_size": 1, "seq_len_q": 8, "seq_len_kv": 16},
+    {"batch_size": 2, "seq_len_q": 16, "seq_len_kv": 32},
+    {"batch_size": 4, "seq_len_q": 32, "seq_len_kv": 64},
 )
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare the attention output projection implementation against the torch reference",
+        description="Compare the attention backward implementation against the torch reference",
     )
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument(
         "--impl",
         default="auto",
-        choices=("auto", "torch_ref", "triton", "cutile", "cutedsl"),
-        help="Implementation to validate. 'auto' picks cutedsl on CUDA and torch_ref otherwise.",
+        choices=("auto", "torch_ref", "triton"),
+        help="Implementation to validate. 'auto' picks triton on CUDA and torch_ref otherwise.",
     )
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument("--seq-len-q", type=int, default=None)
+    parser.add_argument("--seq-len-kv", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--random-tests", type=int, default=0)
     parser.add_argument("--atol", type=float, default=1e-2)
@@ -59,57 +57,79 @@ def _load_module(module_path: Path, module_name: str):
 
 def _resolve_impl_name(impl_arg: str, device: torch.device) -> str:
     if impl_arg == "auto":
-        return "cutedsl" if device.type == "cuda" else "torch_ref"
-    if impl_arg in ("triton", "cutile", "cutedsl") and device.type != "cuda":
-        raise RuntimeError(f"The {impl_arg} implementation requires a CUDA device")
+        return "triton" if device.type == "cuda" else "torch_ref"
+    if impl_arg == "triton" and device.type != "cuda":
+        raise RuntimeError("The Triton implementation requires a CUDA device")
     return impl_arg
 
 
 def _collect_cases(args: argparse.Namespace) -> list[dict[str, int]]:
-    if args.batch_size is not None or args.seq_len is not None:
-        return [{"batch_size": args.batch_size or 4, "seq_len": args.seq_len or 128}]
+    if (
+        args.batch_size is not None
+        or args.seq_len_q is not None
+        or args.seq_len_kv is not None
+    ):
+        return [
+            {
+                "batch_size": args.batch_size or 2,
+                "seq_len_q": args.seq_len_q or 16,
+                "seq_len_kv": args.seq_len_kv or 32,
+            }
+        ]
     return list(DEFAULT_CASES)
 
 
 def _random_case() -> dict[str, int]:
     return {
-        "batch_size": int(torch.randint(1, 9, ()).item()),
-        "seq_len": int(torch.randint(1, 9, ()).item()) * 64,
-    }
-
-
-def _get_inputs(axes: dict[str, int], device: torch.device) -> dict:
-    B, S, H = axes["batch_size"], axes["seq_len"], HIDDEN_SIZE
-    return {
-        "attn_output":  torch.randn(B, S, H, dtype=torch.bfloat16, device=device),
-        "residual":     torch.randn(B, S, H, dtype=torch.bfloat16, device=device),
-        "o_proj_weight": torch.randn(H, H, dtype=torch.bfloat16, device=device),
+        "batch_size": int(torch.randint(1, 5, ()).item()),
+        "seq_len_q": int(torch.randint(1, 5, ()).item()) * 8,
+        "seq_len_kv": int(torch.randint(1, 9, ()).item()) * 8,
     }
 
 
 def _run_case(
     case_id: int,
-    axes: dict[str, int],
+    axes_and_scalars: dict[str, int],
     device: torch.device,
     ref_run,
     impl_run,
     impl_name: str,
+    get_inputs,
     atol: float,
     rtol: float,
 ) -> bool:
-    inputs = _get_inputs(axes, device)
+    inputs = get_inputs(axes_and_scalars, device=device)
 
-    ref_out = ref_run(**inputs)
-    out = impl_run(**inputs)
+    ref_grad_attn_scores, ref_grad_value_states = ref_run(**inputs)
+    out_grad_attn_scores, out_grad_value_states = impl_run(**inputs)
 
-    allclose = torch.allclose(out, ref_out, atol=atol, rtol=rtol)
-    max_diff = (out.float() - ref_out.float()).abs().max().item()
+    scores_allclose = torch.allclose(
+        out_grad_attn_scores,
+        ref_grad_attn_scores,
+        atol=atol,
+        rtol=rtol,
+    )
+    values_allclose = torch.allclose(
+        out_grad_value_states,
+        ref_grad_value_states,
+        atol=atol,
+        rtol=rtol,
+    )
+
+    scores_max_abs_diff = (
+        out_grad_attn_scores.float() - ref_grad_attn_scores.float()
+    ).abs().max().item()
+    values_max_abs_diff = (
+        out_grad_value_states.float() - ref_grad_value_states.float()
+    ).abs().max().item()
 
     print(
-        f"case={case_id} impl={impl_name} axes={axes} "
-        f"allclose={allclose} max_abs_diff={max_diff:.6f}"
+        f"case={case_id} impl={impl_name} axes={axes_and_scalars} "
+        f"scores_allclose={scores_allclose} values_allclose={values_allclose} "
+        f"scores_max_abs_diff={scores_max_abs_diff:.8f} "
+        f"values_max_abs_diff={values_max_abs_diff:.8f}"
     )
-    return allclose
+    return scores_allclose and values_allclose
 
 
 if __name__ == "__main__":
@@ -117,13 +137,9 @@ if __name__ == "__main__":
     device = _resolve_device(args.device)
     impl_name = _resolve_impl_name(args.impl, device)
 
-    torch_ref_module = _load_module(TORCH_REF_PATH, "atten_res_torch_ref")
+    torch_ref_module = _load_module(TORCH_REF_PATH, "attn_bwd_torch_ref")
     if impl_name == "triton":
-        impl_module = _load_module(TRITON_PATH, "atten_res_triton")
-    elif impl_name == "cutile":
-        impl_module = _load_module(CUTILE_PATH, "atten_res_cutile")
-    elif impl_name == "cutedsl":
-        impl_module = _load_module(CUTEDSL_PATH, "atten_res_cutedsl")
+        impl_module = _load_module(TRITON_PATH, "attn_bwd_triton")
     else:
         impl_module = torch_ref_module
 
@@ -141,12 +157,15 @@ if __name__ == "__main__":
     print(f"num_cases={len(cases)}")
 
     num_passed = 0
-    for case_id, axes in enumerate(cases):
+    for case_id, axes_and_scalars in enumerate(cases):
         if _run_case(
-            case_id, axes, device,
+            case_id,
+            axes_and_scalars,
+            device,
             ref_run=torch_ref_module.run,
             impl_run=impl_module.run,
             impl_name=impl_name,
+            get_inputs=torch_ref_module.get_inputs,
             atol=args.atol,
             rtol=args.rtol,
         ):
