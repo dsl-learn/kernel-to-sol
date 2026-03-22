@@ -41,3 +41,4 @@ The `.claude/skills/` directory contains model-invoked skills for this project:
 
 - Benchmark: <https://research.nvidia.com/benchmarks/sol-execbench>
 - Original repository: <https://github.com/nvidia/sol-execbench>
+- SOLAR (Speed-Of-Light Achievable Roofline): <https://github.com/NVlabs/SOLAR>
