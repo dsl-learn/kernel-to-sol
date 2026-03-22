@@ -45,3 +45,34 @@ Open `<problem>/test.py` and:
 | CUDA error on first run | Input tensor not `.contiguous()` before TMA use |
 | Shape mismatch for odd seq_len | Missing boundary mask or TMA bounds |
 | Multi-output order wrong | Return order differs from reference |
+| NaN output in spatial-split kernel | Chunk-boundary mask bug (see below) |
+
+## Platform submission constraints (sol-execbench)
+
+### Forbidden keyword: `stream`
+
+The submission validator does a **literal keyword scan** of the source file.
+The word `stream` anywhere — including comments and docstrings — causes rejection:
+
+```
+Value error, Source file 'submission.py' contains the forbidden keyword 'stream'.
+CUDA stream usage is not permitted in Python solutions.
+```
+
+- Never write `stream` in any comment, docstring, variable name, or string literal.
+- Rephrase: "CUDA stream barrier" → "implicit barrier between launches".
+- Multiple kernel launches in sequence are **allowed**; only the word is banned.
+- **Check before submitting:** `grep -n stream kernel.py`
+
+### Chunk-boundary mask bug in spatial-split kernels
+
+When splitting a group into S chunks and `chunk_size < BLOCK`, the mask
+`offs < group_size` alone is **insufficient** — adjacent chunks overlap,
+double-count elements, corrupt partial stats, and produce NaN variance.
+
+Always use the tighter mask in both the stats and norm passes:
+
+```python
+chunk_end = chunk_start + chunk_size
+mask = (offs < chunk_end) & (offs < group_size)
+```
