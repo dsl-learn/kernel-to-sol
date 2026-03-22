@@ -7,8 +7,8 @@ import torch
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-TORCH_REF_PATH = ROOT_DIR / "00_torch_ref" / "submission.py"
-TRITON_PATH = ROOT_DIR / "01_triton" / "submission.py"
+TORCH_REF_PATH = ROOT_DIR / "00_torch_ref" / "kernel.py"
+TRITON_PATH = ROOT_DIR / "01_triton" / "kernel.py"
 
 DEFAULT_NUM_GROUPS = 32
 DEFAULT_KERNEL_SIZE = 3
