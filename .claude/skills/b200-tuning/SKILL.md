@@ -11,15 +11,75 @@ description: >
 
 ## Hardware reference — NVIDIA B200 (sm_100a)
 
+### Capacity
+
 | Property | Value |
 |---|---|
-| BF16 compute | ~2.25 PFlops (WGMMA / tcgen05) |
-| SRAM per SM | 228 KB |
-| L2 cache | 96 MB |
-| HBM3e bandwidth | 8 TB/s |
+| L2 cache | 192 MB (201 326 592 B) |
+| HBM3e capacity | 192 GB |
+| Clock frequency | 1.5 GHz |
 | Warp groups per SM | 4 × 128 threads |
+| SRAM per SM | 228 KB |
 | TMA | Hardware async copy with bounds checking |
 | WGMMA atom (BF16) | `64×N×K`, K multiple of 16 |
+
+### Throughput (at 1.5 GHz)
+
+| Precision | MAC/cycle | TFLOPS |
+|---|---|---|
+| NVFP4 (TC) | 2 415 000 | 7 245 |
+| INT8 (TC) | 1 207 500 | 3 623 |
+| FP8 (TC) | 1 207 501 | 3 623 |
+| FP16 (TC) | 603 751 | 1 811 |
+| BF16 (TC) | 603 751 | 1 811 |
+| TF32 (TC) | 301 875 | 906 |
+| FP32 (CUDA core) | 40 251 | 121 |
+
+### Bandwidth
+
+| Bus | Bytes/cycle | TB/s |
+|---|---|---|
+| L2 (SRAM) | 43 691 | 64 |
+| HBM3e (DRAM) | 5 111.6 | 8 |
+
+## Roofline analysis (always use 1.5 GHz figures)
+
+Use these constants directly when estimating kernel performance. **1.5 GHz is the reference clock for all calculations.**
+
+```python
+FREQ_GHz   = 1.5
+HBM_BW     = 8e12    # bytes/s  (8 TB/s)
+L2_BW      = 64e12   # bytes/s  (64 TB/s)
+
+# Peak FLOPS by precision
+BF16_TFLOPS  = 1811e12   # BF16 tensor core
+FP32_TFLOPS  = 121e12    # FP32 CUDA core
+FP8_TFLOPS   = 3623e12
+```
+
+**Memory-bound kernel (e.g. GroupNorm, LayerNorm, elementwise):**
+
+```python
+bytes_read  = tensor_elements * dtype_bytes   # reads
+bytes_write = out_elements    * dtype_bytes   # writes
+total_bytes = bytes_read + bytes_write
+
+t_hbm_ms = total_bytes / HBM_BW * 1e3        # theoretical minimum (ms)
+# If measured latency >> t_hbm_ms → kernel is not bandwidth-saturated
+```
+
+**Compute-bound kernel (e.g. GEMM, Conv):**
+
+```python
+flops    = 2 * M * N * K                     # matmul FLOPs
+t_tc_ms  = flops / BF16_TFLOPS * 1e3         # theoretical minimum (ms)
+# Arithmetic intensity = flops / total_bytes
+# If intensity > BF16_TFLOPS / HBM_BW ≈ 226 FLOP/byte → compute-bound
+```
+
+**Ridge point (BF16):** `1811 TFLOPS / 8 TB/s ≈ 226 FLOP/byte`
+- Below 226 FLOP/byte → memory-bound, optimize bandwidth
+- Above 226 FLOP/byte → compute-bound, optimize tile/pipeline
 
 ## Triton
 
